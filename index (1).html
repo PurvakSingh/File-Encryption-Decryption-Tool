@@ -1,0 +1,256 @@
+<script type="text/javascript">
+        var gk_isXlsx = false;
+        var gk_xlsxFileLookup = {};
+        var gk_fileData = {};
+        function filledCell(cell) {
+          return cell !== '' && cell != null;
+        }
+        function loadFileData(filename) {
+        if (gk_isXlsx && gk_xlsxFileLookup[filename]) {
+            try {
+                var workbook = XLSX.read(gk_fileData[filename], { type: 'base64' });
+                var firstSheetName = workbook.SheetNames[0];
+                var worksheet = workbook.Sheets[firstSheetName];
+
+                // Convert sheet to JSON to filter blank rows
+                var jsonData = XLSX.utils.sheet_to_json(worksheet, { header: 1, blankrows: false, defval: '' });
+                // Filter out blank rows (rows where all cells are empty, null, or undefined)
+                var filteredData = jsonData.filter(row => row.some(filledCell));
+
+                // Heuristic to find the header row by ignoring rows with fewer filled cells than the next row
+                var headerRowIndex = filteredData.findIndex((row, index) =>
+                  row.filter(filledCell).length >= filteredData[index + 1]?.filter(filledCell).length
+                );
+                // Fallback
+                if (headerRowIndex === -1 || headerRowIndex > 25) {
+                  headerRowIndex = 0;
+                }
+
+                // Convert filtered JSON back to CSV
+                var csv = XLSX.utils.aoa_to_sheet(filteredData.slice(headerRowIndex)); // Create a new sheet from filtered array of arrays
+                csv = XLSX.utils.sheet_to_csv(csv, { header: 1 });
+                return csv;
+            } catch (e) {
+                console.error(e);
+                return "";
+            }
+        }
+        return gk_fileData[filename] || "";
+        }
+        </script><!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>File Encryption/Decryption Tool</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.development.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.development.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.22.5/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        .animate-spin {
+            animation: spin 1s linear infinite;
+        }
+        .fade-in {
+            animation: fadeIn 0.5s ease-in;
+        }
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+    </style>
+</head>
+<body class="bg-gray-100 min-h-screen flex items-center justify-center p-4">
+    <div id="root"></div>
+    <script type="text/babel">
+        function App() {
+            const [mode, setMode] = React.useState('encrypt');
+            const [file, setFile] = React.useState(null);
+            const [password, setPassword] = React.useState('');
+            const [status, setStatus] = React.useState('');
+            const [error, setError] = React.useState('');
+            const [isLoading, setIsLoading] = React.useState(false);
+
+            const deriveKey = async (password, salt = null) => {
+                const enc = new TextEncoder();
+                const passwordBuffer = enc.encode(password);
+                if (!salt) salt = crypto.getRandomValues(new Uint8Array(16));
+                const keyMaterial = await crypto.subtle.importKey(
+                    'raw', passwordBuffer, 'PBKDF2', false, ['deriveBits', 'deriveKey']
+                );
+                const key = await crypto.subtle.deriveKey(
+                    {
+                        name: 'PBKDF2',
+                        salt: salt,
+                        iterations: 100000,
+                        hash: 'SHA-256'
+                    },
+                    keyMaterial,
+                    { name: 'AES-GCM', length: 256 },
+                    true,
+                    ['encrypt', 'decrypt']
+                );
+                return { key, salt };
+            };
+
+            const encryptFile = async () => {
+                if (!file || !password || password.length < 8) {
+                    setError('Please select a file and enter a password (min 8 characters).');
+                    return;
+                }
+                setError('');
+                setStatus('Encrypting file...');
+                setIsLoading(true);
+                try {
+                    const fileData = await file.arrayBuffer();
+                    const { key, salt } = await deriveKey(password);
+                    const iv = crypto.getRandomValues(new Uint8Array(12));
+                    const encrypted = await crypto.subtle.encrypt(
+                        { name: 'AES-GCM', iv: iv },
+                        key,
+                        fileData
+                    );
+                    const encryptedArray = new Uint8Array(salt.length + iv.length + encrypted.byteLength);
+                    encryptedArray.set(salt, 0);
+                    encryptedArray.set(iv, salt.length);
+                    encryptedArray.set(new Uint8Array(encrypted), salt.length + iv.length);
+                    const blob = new Blob([encryptedArray], { type: 'application/octet-stream' });
+                    const outputFilename = file.name + '.encrypted';
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = outputFilename;
+                    a.click();
+                    URL.revokeObjectURL(url);
+                    setStatus(`File encrypted successfully! Downloaded as ${outputFilename}`);
+                } catch (e) {
+                    setError('Encryption failed: ' + e.message);
+                    setStatus('');
+                } finally {
+                    setIsLoading(false);
+                }
+            };
+
+            const decryptFile = async () => {
+                if (!file || !password) {
+                    setError('Please select a file and enter a password.');
+                    return;
+                }
+                setError('');
+                setStatus('Decrypting file...');
+                setIsLoading(true);
+                try {
+                    const fileData = await file.arrayBuffer();
+                    if (fileData.byteLength < 28) {
+                        throw new Error('Invalid encrypted file: too small.');
+                    }
+                    const salt = new Uint8Array(fileData.slice(0, 16));
+                    const iv = new Uint8Array(fileData.slice(16, 28));
+                    const ciphertext = fileData.slice(28);
+                    const { key } = await deriveKey(password, salt);
+                    const decrypted = await crypto.subtle.decrypt(
+                        { name: 'AES-GCM', iv: iv },
+                        key,
+                        ciphertext
+                    );
+                    const outputFilename = file.name.endsWith('.encrypted') ? file.name.slice(0, -10) : 'decrypted_' + file.name;
+                    const blob = new Blob([decrypted], { type: file.type || 'application/octet-stream' });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = outputFilename;
+                    a.click();
+                    URL.revokeObjectURL(url);
+                    setStatus(`File decrypted successfully! Downloaded as ${outputFilename}`);
+                } catch (e) {
+                    setError('Decryption failed: Incorrect password or corrupted file.');
+                    setStatus('');
+                } finally {
+                    setIsLoading(false);
+                }
+            };
+
+            const handleFileChange = (e) => {
+                setFile(e.target.files[0]);
+                setStatus('');
+                setError('');
+            };
+
+            const handleSubmit = (e) => {
+                e.preventDefault();
+                if (mode === 'encrypt') {
+                    encryptFile();
+                } else {
+                    decryptFile();
+                }
+            };
+
+            return (
+                <div className="max-w-lg w-full mx-auto bg-white p-8 rounded-xl shadow-2xl">
+                    <h1 className="text-3xl font-bold text-gray-800 mb-6 text-center">Secure File Encryption</h1>
+                    <div className="space-y-6">
+                        <div>
+                            <label className="block text-sm font-medium text-gray-700 mb-2">Mode</label>
+                            <select
+                                value={mode}
+                                onChange={(e) => { setMode(e.target.value); setStatus(''); setError(''); setFile(null); setPassword(''); }}
+                                className="w-full p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition"
+                            >
+                                <option value="encrypt">Encrypt</option>
+                                <option value="decrypt">Decrypt</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label className="block text-sm font-medium text-gray-700 mb-2">File</label>
+                            <input
+                                type="file"
+                                onChange={handleFileChange}
+                                className="w-full p-3 border border-gray-300 rounded-lg file:mr-4 file:py-2 file:px-4 file:rounded-md file:border-0 file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100 transition"
+                            />
+                            {file && <p className="mt-2 text-sm text-gray-600">Selected: {file.name}</p>}
+                        </div>
+                        <div>
+                            <label className="block text-sm font-medium text-gray-700 mb-2">Password</label>
+                            <input
+                                type="password"
+                                value={password}
+                                onChange={(e) => setPassword(e.target.value)}
+                                className="w-full p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition"
+                                placeholder="Enter password (min 8 characters)"
+                            />
+                        </div>
+                        <button
+                            onClick={handleSubmit}
+                            disabled={isLoading}
+                            className={`w-full p-3 rounded-lg text-white font-semibold transition flex items-center justify-center
+                                ${isLoading ? 'bg-blue-400 cursor-not-allowed' : 'bg-blue-600 hover:bg-blue-700'}`}
+                        >
+                            {isLoading ? (
+                                <span className="flex items-center">
+                                    <svg className="animate-spin h-5 w-5 mr-2 text-white" viewBox="0 0 24 24">
+                                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
+                                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+                                    </svg>
+                                    Processing...
+                                </span>
+                            ) : (
+                                mode === 'encrypt' ? 'Encrypt & Download' : 'Decrypt & Download'
+                            )}
+                        </button>
+                        {status && <p className="mt-4 text-green-600 font-medium fade-in">{status}</p>}
+                        {error && <p className="mt-4 text-red-600 font-medium fade-in">{error}</p>}
+                    </div>
+                    <p className="mt-6 text-center text-sm text-gray-500">
+                        All encryption is performed client-side for maximum security. Your file is ready to download upon completion.
+                    </p>
+                </div>
+            );
+        }
+
+        ReactDOM.render(<App />, document.getElementById('root'));
+    </script>
+</body>
+</html>
